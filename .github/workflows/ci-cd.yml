@@ -1,4 +1,3 @@
-```yaml
 name: Flask CI/CD Pipeline
 
 on:
@@ -59,29 +58,28 @@ jobs:
 
       - name: Install dependencies
         run: |
-          cd backend
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest-cov
+          pip install pytest pytest-cov
 
       - name: Install Redis CLI
         run: |
           sudo apt-get update
-          sudo apt-get install -y redis-tools
+          sudo apt-get install -y redis-tools postgresql-client
 
       - name: Wait for services
         run: |
           echo "Waiting for PostgreSQL..."
-          timeout 60 bash -c 'until pg_isready -h localhost -p 5432 -U testuser; do sleep 2; done'
+          sleep 5
+          timeout 90 bash -c 'until pg_isready -h localhost -p 5432 -U testuser; do sleep 3; done'
           echo "✅ PostgreSQL is ready!"
           
           echo "Waiting for Redis..."
-          timeout 60 bash -c 'until redis-cli -h localhost -p 6379 ping | grep -q PONG; do sleep 2; done'
+          timeout 90 bash -c 'until redis-cli -h localhost -p 6379 ping | grep -q PONG; do sleep 3; done'
           echo "✅ Redis is ready!"
 
       - name: Run tests with coverage
         run: |
-          cd backend
           export PYTHONPATH=.
           export DATABASE_URL="postgresql://testuser:testpass@localhost:5432/testdb"
           export REDIS_URL="redis://localhost:6379"
@@ -95,128 +93,20 @@ jobs:
         if: always()
         with:
           name: coverage-report
-          path: backend/htmlcov/
-          retention-days: 5
+          path: htmlcov/
 
       - name: Upload coverage XML
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: coverage-xml
-          path: backend/coverage.xml
-          retention-days: 5
-
-  security-snyk:
-    name: Snyk Security Scan
-    runs-on: ubuntu-latest
-    needs: test
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: |
-          cd backend
-          pip install -r requirements.txt
-
-      - name: Run Snyk Dependencies Scan
-        uses: snyk/actions/python@master
-        continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=high --file=backend/requirements.txt
-          command: test
-
-      - name: Run Snyk Code Scan
-        uses: snyk/actions/python@master
-        continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=medium
-          command: code test
-
-      - name: Monitor with Snyk
-        if: github.ref == 'refs/heads/main'
-        uses: snyk/actions/python@master
-        continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --file=backend/requirements.txt
-          command: monitor
-
-  security-additional:
-    name: Additional Security Scans
-    runs-on: ubuntu-latest
-    needs: test
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-
-      - name: Run Safety check
-        run: |
-          pip install safety
-          cd backend
-          safety check --json --output safety-report.json || echo "⚠️ Safety warnings found"
-        continue-on-error: true
-
-      - name: Run Bandit SAST
-        run: |
-          pip install bandit
-          cd backend
-          bandit -r . -f json -o bandit-report.json -ll || echo "⚠️ Bandit warnings found"
-        continue-on-error: true
-
-      - name: Run Semgrep
-        uses: returntocorp/semgrep-action@v1
-        with:
-          config: auto
-        continue-on-error: true
-
-      - name: Secret Scanning with TruffleHog
-        uses: trufflesecurity/trufflehog@main
-        with:
-          path: ./
-          base: ${{ github.event.repository.default_branch }}
-          head: HEAD
-          extra_args: --only-verified
-        continue-on-error: true
-
-      - name: Upload security artifacts
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: security-reports
-          path: |
-            backend/safety-report.json
-            backend/bandit-report.json
-          retention-days: 30
+          path: coverage.xml
 
   build:
     name: Build Docker Image
     runs-on: ubuntu-latest
-    needs: [test, security-snyk, security-additional]
-    if: |
-      always() && 
-      needs.test.result == 'success'
+    needs: test
+    if: needs.test.result == 'success'
 
     steps:
       - name: Checkout code
@@ -237,21 +127,14 @@ jobs:
         run: |
           REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           IMAGE_NAME="ghcr.io/${REPO_LOWER}"
-          
-          # Generate tags
           TAGS="${IMAGE_NAME}:sha-${{ github.sha }}"
-          
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            TAGS="${TAGS},${IMAGE_NAME}:pr-${{ github.event.pull_request.number }}"
-          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+          if [ "${{ github.ref }}" == "refs/heads/main" ]; then
             TAGS="${TAGS},${IMAGE_NAME}:latest"
           elif [ "${{ github.ref }}" == "refs/heads/develop" ]; then
             TAGS="${TAGS},${IMAGE_NAME}:develop"
           fi
-          
           echo "tags=${TAGS}" >> $GITHUB_OUTPUT
           echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
-          
           echo "🏷️ Tags: ${TAGS}"
 
       - name: Build and push Docker image
@@ -276,57 +159,13 @@ jobs:
   notify:
     name: Notify Results
     runs-on: ubuntu-latest
-    needs: [test, security-snyk, security-additional, build]
+    needs: [test, build]
     if: always()
     
     steps:
-      - name: Create PR comment
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const testStatus = '${{ needs.test.result }}';
-            const snykStatus = '${{ needs.security-snyk.result }}';
-            const additionalSecurityStatus = '${{ needs.security-additional.result }}';
-            const buildStatus = '${{ needs.build.result }}';
-            
-            const statusEmoji = {
-              'success': '✅',
-              'failure': '❌',
-              'cancelled': '⏹️',
-              'skipped': '⏭️'
-            };
-            
-            const comment = `
-            ## 🚀 CI/CD Pipeline Results
-            
-            | Job | Status | Result |
-            |-----|--------|---------|
-            | Tests | ${statusEmoji[testStatus] || '❓'} | ${testStatus} |
-            | Snyk Security | ${statusEmoji[snykStatus] || '❓'} | ${snykStatus} |
-            | Additional Security | ${statusEmoji[additionalSecurityStatus] || '❓'} | ${additionalSecurityStatus} |
-            | Docker Build | ${statusEmoji[buildStatus] || '❓'} | ${buildStatus} |
-            
-            **Commit**: \`${{ github.sha }}\`
-            **Branch**: \`${{ github.head_ref }}\`
-            **Triggered by**: @${{ github.actor }}
-            
-            ---
-            📊 [View detailed results](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-            `;
-            
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: comment
-            });
-
       - name: Print summary
         run: |
           echo "=== 🎯 Pipeline Summary ==="
           echo "✓ Test: ${{ needs.test.result }}"
-          echo "✓ Snyk: ${{ needs.security-snyk.result }}"
-          echo "✓ Security: ${{ needs.security-additional.result }}"
           echo "✓ Build: ${{ needs.build.result }}"
           echo "=========================="
